@@ -6,18 +6,17 @@ import { searchOnYt } from "../lib/ytSearch";
 import { cosineSimilarity } from "../lib/cosineSimilarity";
 
 
-
 export const feedRouter = new Hono<{
     Bindings: {
         GOOGLE_GEMINI_API_KEY: string,
-        YOUTUBE_API_KEY: string , 
-        
+        YOUTUBE_API_KEY: string,
+        AI: Ai
     }
 }>();
 
 let ai: GoogleGenAI;
 
-//all the feedRouter requests come up here then 
+
 feedRouter.get("/feed", async (c) => {
     const userPrompt = "system design"
     if (!ai) {
@@ -31,37 +30,47 @@ feedRouter.get("/feed", async (c) => {
 
     const responseArray = JSON.parse(response.text!);
     console.log(responseArray);
+    // const responseArray = ["system design" , "interview system design" , "building fault tolerant systems"]; 
     // generate five search results based on user's prompt
     const videos = await searchOnYt(responseArray, c.env.YOUTUBE_API_KEY);
     const videoTexts = videos.map((video) => {
         return `${video.snippet.title} ${video.snippet.description}`
     })
 
-    const embeddings = await ai.models.embedContent({
-        model: 'text-embedding-004',
-        contents: [userPrompt, ...videoTexts],
-    });
+    const embeddings = await c.env.AI.run('@cf/qwen/qwen3-embedding-0.6b', {
+        text: [userPrompt, ...videoTexts]
+    })
 
-    const userVector = embeddings.embeddings?.[0].values;
+
+    // const userVector = embeddings.embeddings?.[0].values;
+    const userVector = embeddings.data?.[0];
+    const now = new Date();
 
     const videosWithEmbeddings = videos.map((video, index) => {
-        const videoVector = embeddings.embeddings?.[index + 1].values;
-        const similarityScore = cosineSimilarity(userVector!, videoVector!)
+        const videoVector = embeddings.data?.[index + 1];
+        const semanticScore = cosineSimilarity(userVector!, videoVector!)
+        const publishedDate = new Date(video.snippet.publishedAt);
+        const daysSincePublished = (now.getTime() - publishedDate.getTime()) / (1000 * 60 * 60 * 24);
+        const recencyScore = Math.exp(-daysSincePublished / 30);
+
+        
+        const SEMANTIC_WEIGHT = 0.7;  
+        const RECENCY_WEIGHT = 0.3;   
+
+        const finalScore = (semanticScore * SEMANTIC_WEIGHT) + (recencyScore * RECENCY_WEIGHT);
+
 
         return {
             ...video,
             embedding: videoVector,
-            similarityScore
+            similarityScore: finalScore
         }
     });
 
-    //rank the videos with the similarity score now 
+    // //rank the videos with the similarity score now 
     const rankedVideos = videosWithEmbeddings.sort((a, b) =>
         b.similarityScore - a.similarityScore
-    );
-
-    //apply cosine similarity filter to filter the good videos 
-
+    ).slice(0,35);
 
     return c.json(rankedVideos);
 })
@@ -105,7 +114,7 @@ feedRouter.get('/embedding', async (c) => {
 })
 
 
-feedRouter.get('/embed' , (c) => {
-
-    return c.text("hello there "); 
+feedRouter.get('/embeddings', async(c) => {
+    //generate embeddings code will go here 
+    return c.text("hello there ");
 })

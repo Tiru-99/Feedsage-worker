@@ -1,2 +1,0 @@
-[ai]
-binding = "AI" # This makes the AI models available as `env.AI` in your Worker
