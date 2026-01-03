@@ -16,105 +16,201 @@ export const feedRouter = new Hono<{
 
 let ai: GoogleGenAI;
 
-
 feedRouter.get("/feed", async (c) => {
-    const userPrompt = "system design"
-    if (!ai) {
-        ai = createAiInstance(c.env.GOOGLE_GEMINI_API_KEY);
-    }
-    //put guard rails here to prevent model abuse
-    const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: prompt.replace("<USER_PROMPT>", userPrompt)
-    });
+    const userPrompt = c.req.query("prompt");
 
-    const responseArray = JSON.parse(response.text!);
-    console.log(responseArray);
-    // const responseArray = ["system design" , "interview system design" , "building fault tolerant systems"]; 
-    // generate five search results based on user's prompt
-    const videos = await searchOnYt(responseArray, c.env.YOUTUBE_API_KEY);
-    const videoTexts = videos.map((video) => {
-        return `${video.snippet.title} ${video.snippet.description}`
-    })
-
-    const embeddings = await c.env.AI.run('@cf/qwen/qwen3-embedding-0.6b', {
-        text: [userPrompt, ...videoTexts]
-    })
-
-
-    // const userVector = embeddings.embeddings?.[0].values;
-    const userVector = embeddings.data?.[0];
-    const now = new Date();
-
-    const videosWithEmbeddings = videos.map((video, index) => {
-        const videoVector = embeddings.data?.[index + 1];
-        const semanticScore = cosineSimilarity(userVector!, videoVector!)
-        const publishedDate = new Date(video.snippet.publishedAt);
-        const daysSincePublished = (now.getTime() - publishedDate.getTime()) / (1000 * 60 * 60 * 24);
-        const recencyScore = Math.exp(-daysSincePublished / 30);
-
-        
-        const SEMANTIC_WEIGHT = 0.7;  
-        const RECENCY_WEIGHT = 0.3;   
-
-        const finalScore = (semanticScore * SEMANTIC_WEIGHT) + (recencyScore * RECENCY_WEIGHT);
-
-
-        return {
-            ...video,
-            embedding: videoVector,
-            similarityScore: finalScore
-        }
-    });
-
-    // //rank the videos with the similarity score now 
-    const rankedVideos = videosWithEmbeddings.sort((a, b) =>
-        b.similarityScore - a.similarityScore
-    ).slice(0,35);
-
-    return c.json(rankedVideos);
-})
-
-feedRouter.get('/youtube', async (c) => {
-    const search = "system design ";
-    // Step 1: Search YouTube using the prompt
-    if (!search) {
-        return c.json({
-            message: "No prompt received"
-        });
+    if (!userPrompt) {
+        return c.json(
+            { success: false, message: "Prompt is required" },
+            400
+        );
     }
 
     try {
-        const youtubeSearchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(
-            search
-        )}&key=${c.env.YOUTUBE_API_KEY}&maxResults=10&type=video&relevanceLanguage=en&videoEmbeddable=true`;
+        if(!ai){
+            ai = createAiInstance(c.env.GOOGLE_GEMINI_API_KEY);
+        }
+        //generate search queries
+        const aiResponse = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: prompt.replace("<USER_PROMPT>", userPrompt)
+        });
 
-        const videos = await fetch(youtubeSearchUrl);
-        const jsonVideos = await videos.json();
-        return c.json(jsonVideos);
-    } catch (error: any) {
-        console.log("the erorr is ", error);
-        throw new Error("Cannot fetch youtube videos", error);
+        let searchQueries: string[];
+        try {
+            searchQueries = JSON.parse(aiResponse.text ?? "[]");
+        } catch {
+            return c.json(
+                { success: false, message: "Invalid AI response format" },
+                500
+            );
+        }
+
+        if (!Array.isArray(searchQueries) || searchQueries.length === 0) {
+            return c.json(
+                { success: false, message: "No search queries generated" },
+                500
+            );
+        }
+
+        // fetch YouTube videos
+        const videos = await searchOnYt(searchQueries, c.env.YOUTUBE_API_KEY);
+
+        if (!videos.length) {
+            return c.json({
+                success: true,
+                message: "No videos found",
+                feed: [],
+                topFeed: []
+            });
+        }
+
+        // prepare texts for embeddings
+        const videoTexts = videos.map(
+            (v) => `${v.snippet.title} ${v.snippet.description ?? ""}`
+        );
+
+        // generate embeddings
+        const embeddings = await c.env.AI.run(
+            "@cf/qwen/qwen3-embedding-0.6b",
+            { text: [userPrompt, ...videoTexts] }
+        );
+
+        const userVector = embeddings.data?.[0];
+        if (!userVector) {
+            throw new Error("User embedding generation failed");
+        }
+
+        // score videos
+        const SEMANTIC_WEIGHT = 0.7;
+        const RECENCY_WEIGHT = 0.3;
+        const RECENCY_DECAY_DAYS = 30;
+        const TOP_K = 35;
+
+        const now = Date.now();
+
+        const videosWithScores = videos
+            .map((video, index) => {
+                const videoVector = embeddings.data?.[index + 1];
+                if (!videoVector) return null;
+
+                const semanticScore = cosineSimilarity(userVector, videoVector);
+
+                const publishedAt = new Date(video.snippet.publishedAt).getTime();
+                const daysOld = (now - publishedAt) / (1000 * 60 * 60 * 24);
+                const recencyScore = Math.exp(-daysOld / RECENCY_DECAY_DAYS);
+
+                const finalScore =
+                    semanticScore * SEMANTIC_WEIGHT +
+                    recencyScore * RECENCY_WEIGHT;
+
+                return {
+                    ...video,
+                    embedding: videoVector,
+                    semanticScore,
+                    recencyScore,
+                    finalScore
+                };
+            })
+            .filter(Boolean);
+
+        // top 35 ranked feed
+        const topFeed = [...videosWithScores]
+            .sort((a, b) => b!.finalScore - a!.finalScore)
+            .slice(0, TOP_K);
+
+        return c.json({
+            success: true,
+            message: "Feed generated successfully",
+            feed: videosWithScores,   
+            topFeed                   
+        });
+
+    } catch (error) {
+        console.error("[FEED_ERROR]", error);
+
+        return c.json(
+            {
+                success: false,
+                message: "Failed to generate feed",
+                feed: [],
+                topFeed: []
+            },
+            500
+        );
     }
-    //call youtube api for this   
+});
 
+
+
+feedRouter.post("/embedding", async (c) => {
+    const { title, description } = await c.req.json();
+    if (!title || !description) {
+        return c.json({
+            message: "Incomplete details sent",
+            success: false,
+            embeddings: []
+        }, 400)
+    }
+    try {
+        const embeddings = await c.env.AI.run('@cf/qwen/qwen3-embedding-0.6b', {
+            text: `${title} ${description}`
+        });
+
+        if (!embeddings) {
+            return c.json({
+                message: "Embeddings not generated , something went wrong",
+                success: false,
+                embeddings: []
+            }, 500)
+        }
+        return c.json({
+            message: "Embeddings received successfully",
+            embeddings,
+            success: true
+        }, 200);
+
+    } catch (error) {
+        return c.json({
+            message: "Something went wrong while getting embeddings",
+            success: false,
+            embeddings: []
+        }, 500)
+    }
 })
 
-feedRouter.get('/embedding', async (c) => {
-    const ai = new GoogleGenAI({
-        apiKey: c.env.GOOGLE_GEMINI_API_KEY
-    });
+feedRouter.get('/score/:search/:prompt', async (c) => {
+    const { search, prompt } = c.req.param();
 
-    const response = await ai.models.embedContent({
-        model: 'gemini-embedding-001',
-        contents: 'What is the meaning of life?',
-    });
+    try {
+        const embeddings = await c.env.AI.run('@cf/qwen/qwen3-embedding-0.6b', {
+            text: [search, prompt]
+        });
 
-    return c.json(response.embeddings);
-})
+        const seachVector = embeddings.data?.[0];
+        const promptVector = embeddings.data?.[0];
 
+        if (!seachVector || !promptVector) {
+            return c.json({
+                message: "No vectors found !",
+                score: null,
+                success: false
+            }, 500)
+        }
 
-feedRouter.get('/embeddings', async(c) => {
-    //generate embeddings code will go here 
-    return c.text("hello there ");
+        const semanticScore = cosineSimilarity(seachVector, promptVector);
+
+        return c.json({
+            message: "Successfully fetched the score",
+            score: semanticScore,
+            success: true
+        }, 200);
+    } catch (error) {
+        console.log("Something went wrong while fetching score", error);
+        return c.json({
+            message: "Internal server error while calculating score",
+            score: null,
+            success: false
+        }, 500)
+    }
 })
