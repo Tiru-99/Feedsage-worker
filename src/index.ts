@@ -19,7 +19,6 @@ app.get('/', (c) => {
 app.get('/embed', async (c) => {
   const text = "Hello There"
 
-  // Use the AI binding to run the embedding model
   const response = await c.env.AI.run('@cf/qwen/qwen3-embedding-0.6b', {
     text: [text]
   })
@@ -32,7 +31,7 @@ app.get('/runtime', (c) => {
   return c.text(runtime);
 })
 
-app.get('/model', async(c) => {
+app.get('/model', async (c) => {
   const userPrompt = "system design";
   const messages = [
     { role: "system", content: prompt.replace("<USER_PROMPT>", userPrompt) },
@@ -53,10 +52,3 @@ app.route('/generate', feedRouter);
 
 
 export default app
-
-
-/*
-  Steps to build an ai pipeline 
-  search 5 results 
-  build a feed from that 
-*/
